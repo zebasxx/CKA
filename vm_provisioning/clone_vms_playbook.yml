@@ -1,0 +1,100 @@
+---
+- name: Clone four training VMs from the Ubuntu template
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: true
+  vars_files:
+    - vars.yml
+
+  tasks:
+    - name: Validate the four-VM training lab definition
+      ansible.builtin.assert:
+        that:
+          - vms | length == 4
+          - vms | selectattr('role', 'equalto', 'control_plane') | list | length == 1
+          - vms | selectattr('role', 'equalto', 'worker') | list | length == 2
+          - vms | selectattr('role', 'equalto', 'practice_cluster') | list | length == 1
+          - vms | map(attribute='name') | unique | list | length == 4
+          - vms | map(attribute='mac') | unique | list | length == 4
+          - vms | map(attribute='ip') | unique | list | length == 4
+        fail_msg: >-
+          The VM definition must contain one primary control-plane node, two
+          workers, and one secondary practice-cluster node, all with unique
+          names, MAC addresses, and IP addresses.
+
+    - name: Check required cloning tools
+      ansible.builtin.command:
+        argv: ["{{ item }}", --version]
+      loop: [virt-clone, virt-customize, virsh, qemu-img]
+      changed_when: false
+      check_mode: false
+
+    - name: Ensure the dedicated lab network exists
+      ansible.builtin.import_tasks: tasks/network.yml
+
+    - name: Read existing virtual machines
+      ansible.builtin.command:
+        argv: [virsh, --connect, "{{ libvirt_uri }}", list, --all, --name]
+      register: existing_domains
+      changed_when: false
+      check_mode: false
+
+    - name: Require the Ubuntu template
+      ansible.builtin.assert:
+        that: template_name in existing_domains.stdout_lines
+        fail_msg: >-
+          Template {{ template_name }} does not exist. Run
+          create_template_playbook.yml before this playbook.
+
+    - name: Check the template generalization marker
+      ansible.builtin.stat:
+        path: "{{ template_ready_marker }}"
+      register: template_marker
+
+    - name: Require a completely generalized template
+      ansible.builtin.assert:
+        that: template_marker.stat.isreg | default(false)
+        fail_msg: >-
+          Template {{ template_name }} is not marked as generalized.
+          Run create_template_playbook.yml and resolve its reported template state.
+
+    - name: Confirm the template is powered off
+      ansible.builtin.command:
+        argv: [virsh, --connect, "{{ libvirt_uri }}", domstate, "{{ template_name }}"]
+      register: template_state
+      changed_when: false
+      check_mode: false
+
+    - name: Require an offline template before cloning
+      ansible.builtin.assert:
+        that: template_state.stdout | trim == 'shut off'
+        fail_msg: >-
+          Template {{ template_name }} must be powered off before cloning;
+          current state is {{ template_state.stdout | trim }}.
+
+    - name: Ensure the VM storage directory exists
+      ansible.builtin.file:
+        path: "{{ vm_directory }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Clone each missing lab VM from the template
+      ansible.builtin.include_tasks: tasks/clone_vm.yml
+      loop: "{{ vms }}"
+      loop_control:
+        loop_var: vm
+        label: "{{ vm.name }} ({{ vm.role }})"
+      when: vm.name not in existing_domains.stdout_lines
+
+    - name: Report cloning behavior
+      ansible.builtin.debug:
+        msg: >-
+          Cloning completed for the primary control plane, two workers, and the
+          normally powered-off secondary practice-cluster node.
+          The powered-off {{ template_name }} domain was retained for future clones,
+          and existing domains were left unchanged. Inspect addresses with
+          virsh -c {{ libvirt_uri }} net-dhcp-leases {{ vm_network }}.
+          SSH as {{ vm_user }}. This playbook installs no application software.

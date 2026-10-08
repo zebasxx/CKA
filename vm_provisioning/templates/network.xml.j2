@@ -1,0 +1,14 @@
+<network>
+  <name>{{ vm_network }}</name>
+  <forward mode="nat"/>
+  <bridge name="{{ vm_bridge }}" stp="on" delay="0"/>
+  <domain name="{{ vm_domain }}" localOnly="yes"/>
+  <ip address="{{ vm_gateway }}" netmask="{{ vm_netmask }}">
+    <dhcp>
+      <range start="{{ vm_dhcp_start }}" end="{{ vm_dhcp_end }}"/>
+{% for vm in vms %}
+      <host mac="{{ vm.mac }}" name="{{ vm.name }}" ip="{{ vm.ip }}"/>
+{% endfor %}
+    </dhcp>
+  </ip>
+</network>

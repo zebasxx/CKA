@@ -1,0 +1,51 @@
+---
+libvirt_uri: qemu:///system
+vm_directory: /var/vms/k8s_Lab
+ubuntu_iso: /var/vms/ISOs/ubuntu-26.04.1-live-server-amd64.iso
+# Generic fallback when the host libosinfo database does not know Ubuntu 26.04.
+vm_osinfo: linux2024
+vm_user: ubuntu
+ssh_public_key_file: "{{ lookup('ansible.builtin.env', 'HOME') }}/.ssh/id_ed25519.pub"
+vm_ssh_key: "{{ lookup('ansible.builtin.file', ssh_public_key_file) }}"
+vm_memory_mb: 3072
+# Match the existing reusable template; clone disks cannot be shrunk safely.
+vm_disk_gb: 30
+install_timeout_minutes: 30
+template_name: k8s-ubuntu-template
+template_cpus: 2
+template_disk: "{{ vm_directory }}/{{ template_name }}.qcow2"
+template_ready_marker: "{{ vm_directory }}/{{ template_name }}.ready"
+
+vm_network: k8s-lab
+vm_bridge: virbr-k8s
+vm_domain: k8s.test
+vm_gateway: 192.168.124.1
+vm_netmask: 255.255.255.0
+vm_dhcp_start: 192.168.124.100
+vm_dhcp_end: 192.168.124.199
+
+vms:
+  - name: cka-cp01
+    role: control_plane
+    cpus: 2
+    start: true
+    mac: 52:54:00:ca:10:01
+    ip: 192.168.124.51
+  - name: cka-worker01
+    role: worker
+    cpus: 2
+    start: true
+    mac: 52:54:00:ca:20:01
+    ip: 192.168.124.61
+  - name: cka-worker02
+    role: worker
+    cpus: 2
+    start: true
+    mac: 52:54:00:ca:20:02
+    ip: 192.168.124.62
+  - name: cka-context01
+    role: practice_cluster
+    cpus: 2
+    start: false
+    mac: 52:54:00:ca:30:01
+    ip: 192.168.124.71

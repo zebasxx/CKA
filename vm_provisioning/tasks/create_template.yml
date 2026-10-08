@@ -1,0 +1,162 @@
+---
+- name: Check for an orphaned template disk
+  ansible.builtin.stat:
+    path: "{{ template_disk }}"
+  register: existing_template_disk
+
+- name: Refuse to overwrite an orphaned template disk
+  ansible.builtin.assert:
+    that: not existing_template_disk.stat.exists
+    fail_msg: >-
+      {{ template_disk }} exists but domain {{ template_name }} is missing.
+      Recover it or move the disk aside deliberately before retrying.
+
+- name: Create the template seed directory
+  ansible.builtin.file:
+    path: "{{ vm_directory }}/seeds/{{ template_name }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Render template unattended installation configuration
+  ansible.builtin.template:
+    src: template-autoinstall-user-data.yml.j2
+    dest: "{{ vm_directory }}/seeds/{{ template_name }}/user-data"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Write template NoCloud metadata
+  ansible.builtin.copy:
+    dest: "{{ vm_directory }}/seeds/{{ template_name }}/meta-data"
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      instance-id: {{ template_name }}-installer
+      local-hostname: {{ template_name }}
+
+- name: Build the template installer seed ISO
+  ansible.builtin.command:
+    argv:
+      - xorriso
+      - -as
+      - mkisofs
+      - -quiet
+      - -volid
+      - cidata
+      - -joliet
+      - -rock
+      - -output
+      - "{{ vm_directory }}/seeds/{{ template_name }}/seed.iso"
+      - "{{ vm_directory }}/seeds/{{ template_name }}/user-data"
+      - "{{ vm_directory }}/seeds/{{ template_name }}/meta-data"
+  changed_when: true
+  when: not ansible_check_mode
+
+- name: Install the Ubuntu template and leave it powered off
+  ansible.builtin.command:
+    argv:
+      - virt-install
+      - --connect
+      - "{{ libvirt_uri }}"
+      - --name
+      - "{{ template_name }}"
+      - --memory
+      - "{{ vm_memory_mb | string }}"
+      - --vcpus
+      - "{{ template_cpus | string }}"
+      - --osinfo
+      - "{{ vm_osinfo }}"
+      - --disk
+      - "path={{ template_disk }},format=qcow2,size={{ vm_disk_gb }},bus=virtio"
+      - --disk
+      - "path={{ vm_directory }}/seeds/{{ template_name }}/seed.iso,device=cdrom,target.dev=sda"
+      - --location
+      - "{{ ubuntu_iso }},kernel=casper/vmlinuz,initrd=casper/initrd"
+      - --extra-args
+      - autoinstall ds=nocloud console=ttyS0,115200n8
+      - --network
+      - "network={{ vm_network }},model=virtio"
+      - --graphics
+      - none
+      - --noautoconsole
+      - --wait
+      - "{{ install_timeout_minutes | string }}"
+  changed_when: true
+  when: not ansible_check_mode
+
+- name: Read template state after installation
+  ansible.builtin.command:
+    argv: [virsh, --connect, "{{ libvirt_uri }}", domstate, "{{ template_name }}"]
+  register: installed_template_state
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Allow the installed guest to initialize its power-button handler
+  ansible.builtin.pause:
+    seconds: 20
+  when:
+    - not ansible_check_mode
+    - installed_template_state.stdout | trim != 'shut off'
+
+- name: Request a graceful template shutdown
+  ansible.builtin.command:
+    argv: [virsh, --connect, "{{ libvirt_uri }}", shutdown, "{{ template_name }}"]
+  changed_when: true
+  when:
+    - not ansible_check_mode
+    - installed_template_state.stdout | trim != 'shut off'
+
+- name: Wait for the template to power off
+  ansible.builtin.command:
+    argv: [virsh, --connect, "{{ libvirt_uri }}", domstate, "{{ template_name }}"]
+  register: powered_off_template_state
+  changed_when: false
+  until: powered_off_template_state.stdout | trim == 'shut off'
+  retries: 60
+  delay: 5
+  when: not ansible_check_mode
+
+- name: Detach the installer seed from the template
+  ansible.builtin.command:
+    argv:
+      - virsh
+      - --connect
+      - "{{ libvirt_uri }}"
+      - detach-disk
+      - "{{ template_name }}"
+      - sda
+      - --config
+  changed_when: true
+  when: not ansible_check_mode
+
+- name: Generalize machine identity and SSH host keys in the template
+  ansible.builtin.command:
+    argv:
+      - virt-customize
+      - --connect
+      - "{{ libvirt_uri }}"
+      - --domain
+      - "{{ template_name }}"
+      - --run-command
+      - rm -f /etc/machine-id
+      - --run-command
+      - rm -f /var/lib/dbus/machine-id
+      - --run-command
+      - rm -f /etc/ssh/ssh_host_*
+      - --run-command
+      - touch /etc/cloud/cloud-init.disabled
+  changed_when: true
+  when: not ansible_check_mode
+
+- name: Record that template generalization completed
+  ansible.builtin.copy:
+    dest: "{{ template_ready_marker }}"
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      Template {{ template_name }} was generalized by create_template_playbook.yml.
+  when: not ansible_check_mode

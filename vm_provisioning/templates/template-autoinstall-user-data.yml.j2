@@ -1,0 +1,39 @@
+#cloud-config
+autoinstall:
+  version: 1
+  refresh-installer:
+    update: false
+  locale: en_US.UTF-8
+  keyboard:
+    layout: us
+  identity:
+    hostname: {{ template_name | to_json }}
+    username: {{ vm_user | to_json }}
+    password: "!"
+  ssh:
+    install-server: true
+    allow-pw: false
+    authorized-keys:
+      - {{ vm_ssh_key | to_json }}
+  network:
+    version: 2
+    ethernets:
+      lan:
+        match:
+          name: "en*"
+        dhcp4: true
+        optional: true
+  storage:
+    layout:
+      name: direct
+  updates: security
+  shutdown: poweroff
+  user-data:
+    users:
+      - name: {{ vm_user | to_json }}
+        groups: [adm, sudo]
+        shell: /bin/bash
+        lock_passwd: true
+        sudo: "ALL=(ALL) NOPASSWD:ALL"
+        ssh_authorized_keys:
+          - {{ vm_ssh_key | to_json }}

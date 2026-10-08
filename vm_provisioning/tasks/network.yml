@@ -1,0 +1,50 @@
+---
+- name: Define the Kubernetes lab NAT network if absent
+  community.libvirt.virt_net:
+    uri: "{{ libvirt_uri }}"
+    name: "{{ vm_network }}"
+    state: present
+    xml: "{{ lookup('ansible.builtin.template', 'network.xml.j2') }}"
+
+- name: Start the Kubernetes lab NAT network
+  community.libvirt.virt_net:
+    uri: "{{ libvirt_uri }}"
+    name: "{{ vm_network }}"
+    state: active
+  when: not ansible_check_mode
+
+- name: Read the current Kubernetes lab network definition
+  ansible.builtin.command:
+    argv: [virsh, --connect, "{{ libvirt_uri }}", net-dumpxml, "{{ vm_network }}"]
+  register: k8s_network_xml
+  changed_when: false
+  check_mode: false
+
+- name: Add missing VM DHCP reservations to the existing network
+  ansible.builtin.command:
+    argv:
+      - virsh
+      - --connect
+      - "{{ libvirt_uri }}"
+      - net-update
+      - "{{ vm_network }}"
+      - add-last
+      - ip-dhcp-host
+      - --xml
+      - <host mac='{{ item.mac }}' name='{{ item.name }}' ip='{{ item.ip }}'/>
+      - --live
+      - --config
+  loop: "{{ vms }}"
+  loop_control:
+    label: "{{ item.name }} -> {{ item.ip }}"
+  when:
+    - not ansible_check_mode
+    - item.mac not in k8s_network_xml.stdout
+  changed_when: true
+
+- name: Enable Kubernetes lab network autostart
+  community.libvirt.virt_net:
+    uri: "{{ libvirt_uri }}"
+    name: "{{ vm_network }}"
+    autostart: true
+  when: not ansible_check_mode

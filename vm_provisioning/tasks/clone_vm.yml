@@ -1,0 +1,129 @@
+---
+- name: Check for a disk left by an earlier clone attempt
+  ansible.builtin.stat:
+    path: "{{ vm_directory }}/{{ vm.name }}.qcow2"
+  register: existing_disk
+
+- name: Refuse to overwrite an orphaned clone disk
+  ansible.builtin.assert:
+    that: not existing_disk.stat.exists
+    fail_msg: >-
+      {{ vm_directory }}/{{ vm.name }}.qcow2 exists but its domain is missing.
+      Recover the VM or move its disk aside deliberately before retrying.
+
+- name: Clone the VM disk and domain definition
+  ansible.builtin.command:
+    argv:
+      - virt-clone
+      - --connect
+      - "{{ libvirt_uri }}"
+      - --original
+      - "{{ template_name }}"
+      - --name
+      - "{{ vm.name }}"
+      - --file
+      - "{{ vm_directory }}/{{ vm.name }}.qcow2"
+      - --mac
+      - "{{ vm.mac }}"
+  changed_when: true
+  when: not ansible_check_mode
+
+- name: Set the clone maximum vCPU count
+  ansible.builtin.command:
+    argv:
+      - virsh
+      - --connect
+      - "{{ libvirt_uri }}"
+      - setvcpus
+      - "{{ vm.name }}"
+      - "{{ vm.cpus | string }}"
+      - --maximum
+      - --config
+  changed_when: true
+  when:
+    - not ansible_check_mode
+    - vm.cpus != template_cpus
+
+- name: Set the clone active vCPU count
+  ansible.builtin.command:
+    argv:
+      - virsh
+      - --connect
+      - "{{ libvirt_uri }}"
+      - setvcpus
+      - "{{ vm.name }}"
+      - "{{ vm.cpus | string }}"
+      - --config
+  changed_when: true
+  when:
+    - not ansible_check_mode
+    - vm.cpus != template_cpus
+
+- name: Set the clone maximum memory
+  ansible.builtin.command:
+    argv:
+      - virsh
+      - --connect
+      - "{{ libvirt_uri }}"
+      - setmaxmem
+      - "{{ vm.name }}"
+      - "{{ vm.memory_mb | default(vm_memory_mb) }}MiB"
+      - --config
+  changed_when: true
+  when: not ansible_check_mode
+
+- name: Set the clone configured memory
+  ansible.builtin.command:
+    argv:
+      - virsh
+      - --connect
+      - "{{ libvirt_uri }}"
+      - setmem
+      - "{{ vm.name }}"
+      - "{{ vm.memory_mb | default(vm_memory_mb) }}MiB"
+      - --config
+  changed_when: true
+  when: not ansible_check_mode
+
+- name: Create the clone seed directory
+  ansible.builtin.file:
+    path: "{{ vm_directory }}/seeds/{{ vm.name }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Render the clone netplan configuration
+  ansible.builtin.template:
+    src: clone-netplan.yml.j2
+    dest: "{{ vm_directory }}/seeds/{{ vm.name }}/00-installer-config.yaml"
+    owner: root
+    group: root
+    mode: '0600'
+
+- name: Apply the unique hostname and network configuration offline
+  ansible.builtin.command:
+    argv:
+      - virt-customize
+      - --connect
+      - "{{ libvirt_uri }}"
+      - --domain
+      - "{{ vm.name }}"
+      - --hostname
+      - "{{ vm.name }}"
+      - --copy-in
+      - "{{ vm_directory }}/seeds/{{ vm.name }}/00-installer-config.yaml:/etc/netplan"
+      - --run-command
+      - systemd-machine-id-setup
+      - --run-command
+      - ssh-keygen -A
+  changed_when: true
+  when: not ansible_check_mode
+
+- name: Start clones selected for the normal training cluster
+  ansible.builtin.command:
+    argv: [virsh, --connect, "{{ libvirt_uri }}", start, "{{ vm.name }}"]
+  changed_when: true
+  when:
+    - not ansible_check_mode
+    - vm.start | default(false) | bool

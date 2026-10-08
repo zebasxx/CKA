@@ -1,0 +1,95 @@
+---
+- name: Build a generalized Ubuntu template for the Kubernetes lab
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: true
+  vars_files:
+    - vars.yml
+
+  tasks:
+    - name: Require an SSH public key for guest access
+      ansible.builtin.assert:
+        that:
+          - vm_ssh_key is match('^(ssh-ed25519|ssh-rsa|ecdsa-sha2-[^ ]+) ')
+        fail_msg: Set ssh_public_key_file to an existing SSH public key.
+
+    - name: Check required template-building tools
+      ansible.builtin.command:
+        argv: ["{{ item }}", --version]
+      loop: [virt-install, virt-customize, virsh, qemu-img, xorriso]
+      changed_when: false
+      check_mode: false
+
+    - name: Ensure the dedicated Kubernetes lab network exists
+      ansible.builtin.import_tasks: tasks/network.yml
+
+    - name: Read existing virtual machines
+      ansible.builtin.command:
+        argv: [virsh, --connect, "{{ libvirt_uri }}", list, --all, --name]
+      register: existing_domains
+      changed_when: false
+      check_mode: false
+
+    - name: Check installation media when the template is missing
+      ansible.builtin.stat:
+        path: "{{ ubuntu_iso }}"
+      register: install_media
+      when: template_name not in existing_domains.stdout_lines
+
+    - name: Require installation media when building the template
+      ansible.builtin.assert:
+        that:
+          - install_media.stat.exists
+          - install_media.stat.isreg | default(false)
+        fail_msg: "Ubuntu ISO not found at {{ ubuntu_iso }}"
+      when: template_name not in existing_domains.stdout_lines
+
+    - name: Ensure the VM storage directory exists
+      ansible.builtin.file:
+        path: "{{ vm_directory }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Build and generalize the Ubuntu template when missing
+      ansible.builtin.include_tasks: tasks/create_template.yml
+      when: template_name not in existing_domains.stdout_lines
+
+    - name: Check the template generalization marker
+      ansible.builtin.stat:
+        path: "{{ template_ready_marker }}"
+      register: template_marker
+
+    - name: Refuse an incomplete or unverified template
+      ansible.builtin.assert:
+        that: template_marker.stat.isreg | default(false)
+        fail_msg: >-
+          Domain {{ template_name }} exists without {{ template_ready_marker }}.
+          Its build may have been interrupted. Inspect or remove that template
+          deliberately, then rerun this playbook; do not clone it as-is.
+      when: not ansible_check_mode or template_name in existing_domains.stdout_lines
+
+    - name: Read template power state
+      ansible.builtin.command:
+        argv: [virsh, --connect, "{{ libvirt_uri }}", domstate, "{{ template_name }}"]
+      register: template_state
+      changed_when: false
+      check_mode: false
+      when: not ansible_check_mode or template_name in existing_domains.stdout_lines
+
+    - name: Require the completed template to be powered off
+      ansible.builtin.assert:
+        that: template_state.stdout | trim == 'shut off'
+        fail_msg: >-
+          Template {{ template_name }} must be powered off; current state is
+          {{ template_state.stdout | trim }}.
+      when: not ansible_check_mode or template_name in existing_domains.stdout_lines
+
+    - name: Report template status
+      ansible.builtin.debug:
+        msg: >-
+          Template {{ template_name }} is ready and remains powered off.
+          Run clone_vms_playbook.yml to create the four training nodes.
+      when: not ansible_check_mode
