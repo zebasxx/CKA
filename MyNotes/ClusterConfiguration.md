@@ -12,15 +12,17 @@ otherwise.
 
 | Node | Role | Address | vCPU | RAM |
 | --- | --- | --- | ---: | ---: |
-| `cka-cp01` | Control plane | `192.168.124.51` | 2 | 3 GiB |
-| `cka-worker01` | Worker | `192.168.124.61` | 2 | 3 GiB |
-| `cka-worker02` | Worker | `192.168.124.62` | 2 | 3 GiB |
+| `krk-sw-mgr01-l` | Control plane | `10.11.1.46` | 2 | 4 GiB |
+| `krk-sw-mgr02-l` | Control plane | `10.11.1.47` | 2 | 4 GiB |
+| `krk-sw-mgr03-l` | Control plane | `10.11.1.48` | 2 | 4 GiB |
+| `krk-sw-int01-l` | Worker | `10.11.1.49` | 4 | 8 GiB |
+| `krk-sw-int02-l` | Worker | `10.11.1.50` | 4 | 8 GiB |
 
 Network ranges:
 
 | Network | CIDR | Notes |
 | --- | --- | --- |
-| VM network | `192.168.124.0/24` | Libvirt `k8s-lab` network. |
+| VM network | `10.11.1.0/24` | Network used by the Terraform-created VMs. |
 | Pod network | `10.244.0.0/16` | Must not overlap the VM or Service network. |
 | Service network | `10.96.0.0/12` | kubeadm default. |
 
@@ -56,16 +58,23 @@ Secrets, and Ingresses. It does not manage containers directly.
 2. Install containerd, runc, and the base CNI binaries on every node.
 3. Configure containerd to use the systemd cgroup driver.
 4. Install `kubelet`, `kubeadm`, `kubectl`, and `crictl`.
-5. Initialize the control plane.
-6. Install Calico.
-7. Join the workers.
-8. Validate node readiness, DNS, and Service connectivity.
+5. Initialize the first control-plane node.
+6. Join the other two control-plane nodes.
+7. Install Calico.
+8. Join the workers.
+9. Validate node readiness, DNS, and Service connectivity.
 
 ---
 
 ## 1. Prepare every node
 
-Run this section on `cka-cp01`, `cka-worker01`, and `cka-worker02`.
+Run this section on all five nodes:
+
+- `krk-sw-mgr01-l`
+- `krk-sw-mgr02-l`
+- `krk-sw-mgr03-l`
+- `krk-sw-int01-l`
+- `krk-sw-int02-l`
 
 ### Confirm identity and connectivity
 
@@ -80,9 +89,11 @@ Test connectivity to the other nodes by IP. Name resolution is convenient but
 not required for this configuration because the API endpoint uses an IP address.
 
 ```bash
-ping -c 2 192.168.124.51
-ping -c 2 192.168.124.61
-ping -c 2 192.168.124.62
+ping -c 2 10.11.1.46
+ping -c 2 10.11.1.47
+ping -c 2 10.11.1.48
+ping -c 2 10.11.1.49
+ping -c 2 10.11.1.50
 ```
 
 ### Disable swap permanently
@@ -407,9 +418,16 @@ Expected results:
 
 ---
 
-## 4. Initialize the control plane
+## 4. Initialize the first control-plane node
 
-Run this section only on `cka-cp01`.
+Run this section only on `krk-sw-mgr01-l`.
+
+The three control-plane nodes use stacked etcd, which is the kubeadm default.
+For now, `10.11.1.46:6443` is the shared control-plane endpoint because the
+five-VM scope does not include a load balancer or virtual IP. This creates
+three control-plane and etcd members, but API access still depends on
+`krk-sw-mgr01-l`. Replace this endpoint with a load-balanced address or a
+virtual IP before treating the API endpoint as highly available.
 
 ### Optional preflight inspection
 
@@ -421,11 +439,18 @@ sudo kubeadm config images pull
 ### Create the cluster
 
 ```bash
-sudo kubeadm init --apiserver-advertise-address=192.168.124.51 --pod-network-cidr=10.244.0.0/16
+sudo kubeadm init \
+  --apiserver-advertise-address=10.11.1.46 \
+  --control-plane-endpoint=10.11.1.46:6443 \
+  --pod-network-cidr=10.244.0.0/16 \
+  --upload-certs
 ```
 
-Save the complete `kubeadm join` command printed at the end. It contains a
-short-lived bootstrap token and the CA certificate hash required by workers.
+Save both complete `kubeadm join` commands printed at the end:
+
+- the control-plane command contains `--control-plane` and a short-lived
+  `--certificate-key`;
+- the worker command does not contain those options.
 
 If initialization fails, inspect the kubelet and control-plane containers
 before resetting anything:
@@ -456,16 +481,58 @@ The control-plane node remains `NotReady` until a cluster CNI is installed.
 
 ---
 
-## 5. Install Calico networking
+## 5. Join the remaining control-plane nodes
 
-Run this section only on `cka-cp01` after `kubeadm init`.
+Run the control-plane join command printed by `kubeadm init` as root on both
+`krk-sw-mgr02-l` and `krk-sw-mgr03-l`. It has this form:
+
+```bash
+sudo kubeadm join 10.11.1.46:6443 \
+  --token <token> \
+  --discovery-token-ca-cert-hash sha256:<hash> \
+  --control-plane \
+  --certificate-key <certificate-key>
+```
+
+The uploaded certificate secret is deleted after two hours, after which its
+decryption key can no longer be used for a join. If necessary, upload the
+certificates again on `krk-sw-mgr01-l`:
+
+```bash
+sudo kubeadm init phase upload-certs --upload-certs
+```
+
+Copy the new certificate key from the output. If the bootstrap token also
+expired, generate a new worker-style join command and add `--control-plane`
+and the new `--certificate-key` when joining each control-plane node:
+
+```bash
+sudo kubeadm token create --print-join-command
+```
+
+After both joins complete, verify the control-plane and etcd static Pods from
+`krk-sw-mgr01-l`:
+
+```bash
+kubectl get nodes --output=wide
+kubectl get pods --namespace=kube-system --output=wide
+```
+
+All three nodes may remain `NotReady` until Calico is installed.
+
+---
+
+## 6. Install Calico networking
+
+Run this section only on `krk-sw-mgr01-l` after all three control-plane nodes
+have joined.
 
 Calico is used instead of plain Flannel because the training plan includes
 Kubernetes NetworkPolicy enforcement. Calico v3.33 supports Kubernetes v1.37.
 
-The upstream Calico custom resource defaults to `192.168.0.0/16`, which would
-overlap this lab's `192.168.124.0/24` VM network. Download it and change the
-pool to the same `10.244.0.0/16` CIDR supplied to `kubeadm init`.
+The upstream Calico custom resource defaults to `192.168.0.0/16`. Change the
+pool to the same `10.244.0.0/16` CIDR supplied to `kubeadm init` so the
+configuration is explicit and consistent.
 
 ```bash
 CALICO_VERSION="v3.33.0"
@@ -511,33 +578,35 @@ Do not install a second cluster CNI, such as Flannel, on top of Calico.
 
 ---
 
-## 6. Join the worker nodes
+## 7. Join the worker nodes
 
-Run the saved command as root on both `cka-worker01` and `cka-worker02`:
+Run the saved worker command as root on both `krk-sw-int01-l` and
+`krk-sw-int02-l`:
 
 ```bash
-sudo kubeadm join 192.168.124.51:6443 \
+sudo kubeadm join 10.11.1.46:6443 \
   --token <token> \
   --discovery-token-ca-cert-hash sha256:<hash>
 ```
 
-If the token expires, generate a new complete command on `cka-cp01`:
+If the token expires, generate a new complete command on
+`krk-sw-mgr01-l`:
 
 ```bash
 sudo kubeadm token create --print-join-command
 ```
 
-Back on `cka-cp01`, watch the nodes:
+Back on `krk-sw-mgr01-l`, watch the nodes:
 
 ```bash
 watch -n2 kubectl get nodes --output=wide
 ```
 
-All three nodes should eventually report `Ready`.
+All five nodes should eventually report `Ready`.
 
 ---
 
-## 7. Validate the cluster
+## 8. Validate the cluster
 
 ### Check system health
 
@@ -641,7 +710,7 @@ Check that the Pod CIDR in the Calico installation matches the CIDR passed to
 
 Use reset only when intentionally rebuilding a disposable lab node.
 
-On the control plane, drain and remove a worker first:
+From a control-plane node, drain and remove a worker first:
 
 ```bash
 kubectl drain <worker-name> \
