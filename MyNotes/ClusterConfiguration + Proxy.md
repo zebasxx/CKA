@@ -1,4 +1,4 @@
-# Kubernetes Cluster Configuration
+# Kubernetes Cluster Configuration with HA Proxy Nodes
 
 These notes build the primary CKA practice cluster with `kubeadm` on Ubuntu.
 Commands are intended for Kubernetes **v1.37** on `amd64` unless noted
@@ -17,6 +17,21 @@ otherwise.
 | `krk-sw-mgr03-l` | Control plane | `10.11.1.48` | 2 | 4 GiB |
 | `krk-sw-int01-l` | Worker | `10.11.1.49` | 4 | 8 GiB |
 | `krk-sw-int02-l` | Worker | `10.11.1.50` | 4 | 8 GiB |
+| `krk-sw-proxy01-l` | External load balancer | `10.11.1.54` | 2 | 4 GiB |
+| `krk-sw-proxy02-l` | External load balancer | `10.11.1.55` | 2 | 4 GiB |
+
+The proxy nodes share `10.11.1.56` through Keepalived. HAProxy listens on the
+VIP and distributes Kubernetes API connections across all three control-plane
+nodes. The proxy nodes are not Kubernetes nodes and do not run Pods or etcd.
+This initial configuration exposes only the API on port `6443`. After an
+in-cluster Traefik deployment exists, HAProxy can also expose ports `80` and
+`443` and forward them to Traefik's worker-node endpoints.
+
+| Endpoint | Address | Purpose |
+| --- | --- | --- |
+| Kubernetes API DNS | `k8s-api-lab.argostranslations.com` | Stable kubeadm and client endpoint. |
+| Kubernetes API VIP | `10.11.1.56:6443` | Keepalived VIP and HAProxy frontend. |
+| Outbound Squid proxy | `10.0.7.10:3128` | Internet downloads and container image pulls. |
 
 Network ranges:
 
@@ -40,6 +55,8 @@ The Pod, Service, and VM networks must not overlap.
 | CNI plugins | Executables used to configure network interfaces inside Pod sandboxes. |
 | Calico | Cluster network implementation and NetworkPolicy engine. |
 | `crictl` | Troubleshooting client for CRI-compatible container runtimes. |
+| Keepalived | Moves the shared VIP between the two external proxy nodes. |
+| HAProxy | Load-balances TCP connections to healthy API servers. |
 
 `kubectl` creates and manages API objects such as Pods, Deployments, Services,
 Secrets, and Ingresses. It does not manage containers directly.
@@ -54,19 +71,262 @@ Secrets, and Ingresses. It does not manage containers directly.
 
 ## Installation overview
 
-1. Prepare every node.
-2. Install containerd, runc, and the base CNI binaries on every node.
-3. Configure containerd to use the systemd cgroup driver.
-4. Install `kubelet`, `kubeadm`, `kubectl`, and `crictl`.
-5. Initialize the first control-plane node.
-6. Join the other two control-plane nodes.
-7. Install Calico.
-8. Join the workers.
-9. Validate node readiness, DNS, and Service connectivity.
+1. Configure DNS, HAProxy, Keepalived, and the API VIP on both proxy nodes.
+2. Prepare all five Kubernetes nodes, including outbound proxy access.
+3. Install containerd, runc, and the base CNI binaries on every Kubernetes node.
+4. Configure containerd to use systemd cgroups and the outbound proxy.
+5. Install `kubelet`, `kubeadm`, `kubectl`, and `crictl`.
+6. Initialize the first control-plane node through the API VIP.
+7. Join the other two control-plane nodes through the API VIP.
+8. Install Calico.
+9. Join the workers.
+10. Validate node readiness, API failover, DNS, and Service connectivity.
 
 ---
 
-## 1. Prepare every node
+## 1. Configure the external API load balancers
+
+Complete this section before running `kubeadm init`. The API DNS record must
+exist in the internal DNS service:
+
+```text
+k8s-api-lab.argostranslations.com  A  10.11.1.56
+```
+
+Verify it from both proxy nodes and all five Kubernetes nodes:
+
+```bash
+getent ahostsv4 k8s-api-lab.argostranslations.com
+```
+
+The result must contain `10.11.1.56`.
+
+Network firewalls must allow TCP `6443` from Kubernetes nodes and authorized
+administration clients to both proxy nodes, TCP `6443` from both proxy nodes
+to all three managers, and unicast VRRP traffic between the two proxy nodes.
+
+### Install HAProxy and Keepalived
+
+Run on both `krk-sw-proxy01-l` and `krk-sw-proxy02-l`:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y haproxy keepalived netcat-openbsd iputils-arping
+
+id -u keepalived_script >/dev/null 2>&1 || \
+  sudo useradd \
+    --system \
+    --no-create-home \
+    --shell /usr/sbin/nologin \
+    keepalived_script
+
+sudo install -d -m 0755 /usr/local/libexec
+```
+
+Apply the Keepalived networking settings on both proxy nodes:
+
+```bash
+sudo tee /etc/sysctl.d/99-keepalived.conf >/dev/null <<'EOF'
+net.ipv4.ip_nonlocal_bind=1
+net.ipv4.conf.all.arp_ignore=1
+net.ipv4.conf.all.arp_announce=2
+net.ipv4.conf.default.arp_ignore=1
+net.ipv4.conf.default.arp_announce=2
+net.ipv4.conf.all.arp_notify=1
+EOF
+
+sudo sysctl --system
+```
+
+### Configure HAProxy
+
+Run on both proxy nodes:
+
+```bash
+sudo cp --preserve /etc/haproxy/haproxy.cfg \
+  /etc/haproxy/haproxy.cfg.before-kubernetes
+
+sudo tee /etc/haproxy/haproxy.cfg >/dev/null <<'EOF'
+global
+    log /dev/log local0
+    log /dev/log local1 notice
+    user haproxy
+    group haproxy
+    daemon
+
+defaults
+    log global
+    mode tcp
+    option tcplog
+    timeout connect 5s
+    timeout client  50s
+    timeout server  50s
+
+frontend kubernetes_api
+    bind *:6443
+    default_backend kubernetes_api_servers
+
+backend kubernetes_api_servers
+    balance roundrobin
+    option tcp-check
+    server mgr01 10.11.1.46:6443 check fall 3 rise 2
+    server mgr02 10.11.1.47:6443 check fall 3 rise 2
+    server mgr03 10.11.1.48:6443 check fall 3 rise 2
+EOF
+
+sudo haproxy -c -f /etc/haproxy/haproxy.cfg
+sudo systemctl enable haproxy
+sudo systemctl restart haproxy
+systemctl is-active haproxy
+sudo ss -lntp | grep ':6443'
+```
+
+Before kubeadm initializes the API servers, HAProxy will report that its
+backends are unavailable. That is expected; the frontend must still listen on
+TCP port `6443`.
+
+### Install the Keepalived HAProxy health check
+
+Run on both proxy nodes:
+
+```bash
+sudo tee /usr/local/libexec/check-haproxy.sh >/dev/null <<'EOF'
+#!/usr/bin/env bash
+set -o errexit
+
+nc -z 127.0.0.1 6443
+EOF
+
+sudo chown root:root /usr/local/libexec/check-haproxy.sh
+sudo chmod 0755 /usr/local/libexec/check-haproxy.sh
+```
+
+### Configure Keepalived node variables
+
+On `krk-sw-proxy01-l`, set:
+
+```bash
+export KEEPALIVED_NODE_IP="10.11.1.54"
+export KEEPALIVED_PEER_IP="10.11.1.55"
+export KEEPALIVED_PRIORITY="200"
+```
+
+On `krk-sw-proxy02-l`, set:
+
+```bash
+export KEEPALIVED_NODE_IP="10.11.1.55"
+export KEEPALIVED_PEER_IP="10.11.1.54"
+export KEEPALIVED_PRIORITY="150"
+```
+
+On each node, obtain the same Keepalived authentication value securely and
+place it in an environment variable. Keepalived uses only the first eight
+characters for `auth_type PASS`:
+
+```bash
+while :; do read -rsp 'Keepalived shared password: ' KEEPALIVED_AUTH_PASSWORD; echo; [[ "$KEEPALIVED_AUTH_PASSWORD" =~ ^[A-Za-z0-9]{8,}$ ]] && break; echo 'Use at least eight alphanumeric characters'; done
+```
+
+Validate all required values before writing the configuration:
+
+```bash
+: "${KEEPALIVED_NODE_IP:?required}"
+: "${KEEPALIVED_PEER_IP:?required}"
+: "${KEEPALIVED_PRIORITY:?required}"
+: "${KEEPALIVED_AUTH_PASSWORD:?required}"
+```
+
+### Configure and start Keepalived
+
+Run the following common block on both proxy nodes after setting their
+node-specific variables. Environment variables do not survive an SSH
+reconnection, so set and validate them in the same terminal session that
+writes the configuration:
+
+```bash
+sudo tee /etc/keepalived/keepalived.conf >/dev/null <<EOF
+global_defs {
+  enable_script_security
+  script_user keepalived_script
+}
+
+vrrp_script chk_haproxy {
+  script "/usr/local/libexec/check-haproxy.sh"
+  interval 2
+  fall 2
+  rise 2
+}
+
+vrrp_instance VI_56 {
+  state BACKUP
+  interface eth0
+  virtual_router_id 56
+  priority ${KEEPALIVED_PRIORITY}
+  advert_int 1
+  preempt_delay 10
+
+  authentication {
+    auth_type PASS
+    auth_pass ${KEEPALIVED_AUTH_PASSWORD:0:8}
+  }
+
+  unicast_src_ip ${KEEPALIVED_NODE_IP}
+  unicast_peer {
+    ${KEEPALIVED_PEER_IP}
+  }
+
+  virtual_ipaddress {
+    10.11.1.56/24 dev eth0
+  }
+
+  track_script {
+    chk_haproxy
+  }
+
+  garp_master_delay 1
+  garp_master_refresh 10
+  garp_master_repeat 2
+}
+EOF
+
+unset KEEPALIVED_AUTH_PASSWORD
+
+sudo chown root:root /etc/keepalived/keepalived.conf
+sudo chmod 0600 /etc/keepalived/keepalived.conf
+sudo keepalived -t -f /etc/keepalived/keepalived.conf
+sudo systemctl enable keepalived
+sudo systemctl restart keepalived
+systemctl is-active keepalived
+```
+
+Do not start or restart Keepalived if `keepalived -t` reports an error. Stop
+the service, correct or regenerate the configuration, and repeat the test
+until it exits successfully with no configuration errors.
+
+### Validate the API VIP
+
+One proxy node, normally `krk-sw-proxy01-l`, must own the VIP:
+
+```bash
+ip -brief address show dev eth0
+```
+
+From any Kubernetes node, verify DNS and the HAProxy listener:
+
+```bash
+getent ahostsv4 k8s-api-lab.argostranslations.com
+nc -zv -w 2 k8s-api-lab.argostranslations.com 6443
+```
+
+The TCP connection must succeed. HAProxy will have no healthy API backend
+until the first control-plane node is initialized.
+
+Do not continue until the VIP, DNS record, HAProxy, and Keepalived are all
+working.
+
+---
+
+## 2. Prepare every Kubernetes node
 
 Run this section on all five nodes:
 
@@ -85,8 +345,8 @@ ip route
 ```
 
 Confirm that every node has a unique hostname, IP address, and MAC address.
-Test connectivity to the other nodes by IP. Name resolution is convenient but
-not required for this configuration because the API endpoint uses an IP address.
+Test connectivity to the other nodes and the load balancer. Name resolution is
+required because the shared API endpoint uses its DNS name.
 
 ```bash
 ping -c 2 10.11.1.46
@@ -94,6 +354,10 @@ ping -c 2 10.11.1.47
 ping -c 2 10.11.1.48
 ping -c 2 10.11.1.49
 ping -c 2 10.11.1.50
+ping -c 2 10.11.1.54
+ping -c 2 10.11.1.55
+ping -c 2 10.11.1.56
+getent ahostsv4 k8s-api-lab.argostranslations.com
 ```
 
 ### Disable swap permanently
@@ -192,6 +456,40 @@ Avoid a general `apt upgrade` in the middle of cluster installation. Apply
 operating-system updates deliberately and reboot before continuing when the
 kernel or core libraries require it.
 
+### Configure temporary outbound proxy access
+
+LAB nodes do not have a direct Internet route. APT already uses its configured
+proxy, but interactive tools such as `curl`, `wget`, and `kubectl` require
+proxy environment variables. Run on every Kubernetes node in each shell used
+for installation:
+
+```bash
+export http_proxy="http://10.0.7.10:3128"
+export https_proxy="http://10.0.7.10:3128"
+export HTTP_PROXY="$http_proxy"
+export HTTPS_PROXY="$https_proxy"
+
+export no_proxy="localhost,127.0.0.1,::1,10.11.1.0/24,10.96.0.0/12,10.244.0.0/16,k8s-api-lab.argostranslations.com,.argostranslations.com,.argosmultilingual.com"
+export NO_PROXY="$no_proxy"
+```
+
+The Kubernetes node, Service, and Pod networks must remain in `NO_PROXY` so
+that Squid does not intercept internal API or workload traffic.
+
+Verify both outbound and direct API endpoint handling:
+
+```bash
+curl -fsSIL --max-time 20 https://github.com | head
+curl --noproxy '*' -kfsS --max-time 5 \
+  https://k8s-api-lab.argostranslations.com:6443/readyz || true
+```
+
+Before `kubeadm init`, HAProxy has no healthy API-server backend. The second
+command may therefore report an empty reply or `SSL_ERROR_SYSCALL` after
+HAProxy accepts and closes the connection. It must not time out or return a
+Squid `Forbidden` response. After the first API server starts, `/readyz`
+should return `ok`.
+
 ### Create a temporary working directory
 
 ```bash
@@ -201,9 +499,10 @@ cd "$HOME/k8s-files"
 
 ---
 
-## 2. Install the container runtime
+## 3. Install the container runtime
 
-Run this section on every node.
+Run this section on every Kubernetes node. Do not install the container runtime
+on the external proxy nodes for this architecture.
 
 ### Install containerd
 
@@ -322,6 +621,26 @@ systemctl is-active containerd
 containerd --version
 ```
 
+Configure the containerd systemd service to use Squid for external image
+registries while bypassing all cluster-local networks. Shell proxy variables
+alone are not inherited by the containerd service:
+
+```bash
+sudo install -d -m 0755 /etc/systemd/system/containerd.service.d
+
+sudo tee /etc/systemd/system/containerd.service.d/proxy.conf >/dev/null <<'EOF'
+[Service]
+Environment="HTTP_PROXY=http://10.0.7.10:3128"
+Environment="HTTPS_PROXY=http://10.0.7.10:3128"
+Environment="NO_PROXY=localhost,127.0.0.1,::1,10.11.1.0/24,10.96.0.0/12,10.244.0.0/16,k8s-api-lab.argostranslations.com,.argostranslations.com,.argosmultilingual.com"
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl restart containerd
+sudo systemctl --no-pager show containerd --property=Environment
+systemctl is-active containerd
+```
+
 If it does not start:
 
 ```bash
@@ -330,10 +649,11 @@ sudo journalctl -u containerd -n 100 --no-pager
 
 ---
 
-## 3. Install Kubernetes tools
+## 4. Install Kubernetes tools
 
-Run this section on every node. Installing `kubectl` on workers is optional,
-but keeping the same toolset on all lab nodes is convenient.
+Run this section on every Kubernetes node. Do not install kubelet or kubeadm on
+the external proxy nodes. Installing `kubectl` on workers is optional, but
+keeping the same toolset on all Kubernetes nodes is convenient.
 
 ### Configure the Kubernetes v1.37 repository
 
@@ -418,32 +738,34 @@ Expected results:
 
 ---
 
-## 4. Initialize the first control-plane node
+## 5. Initialize the first control-plane node
 
 Run this section only on `krk-sw-mgr01-l`.
 
 The three control-plane nodes use stacked etcd, which is the kubeadm default.
-For now, `10.11.1.46:6443` is the shared control-plane endpoint because the
-five-VM scope does not include a load balancer or virtual IP. This creates
-three control-plane and etcd members, but API access still depends on
-`krk-sw-mgr01-l`. Replace this endpoint with a load-balanced address or a
-virtual IP before treating the API endpoint as highly available.
+The shared endpoint is `k8s-api-lab.argostranslations.com:6443`, which resolves
+to the Keepalived VIP. HAProxy distributes connections to healthy API servers.
 
 ### Optional preflight inspection
 
 ```bash
-sudo kubeadm config images list
-sudo kubeadm config images pull
+sudo kubeadm config images list --kubernetes-version=v1.37.2
+sudo kubeadm config images pull --kubernetes-version=v1.37.2
 ```
+
+Using an explicit version prevents kubeadm from trying to discover the latest
+stable version from `dl.k8s.io`. Image downloads are performed by containerd,
+which uses the systemd proxy drop-in configured earlier.
 
 ### Create the cluster
 
 ```bash
 sudo kubeadm init \
   --apiserver-advertise-address=10.11.1.46 \
-  --control-plane-endpoint=10.11.1.46:6443 \
+  --control-plane-endpoint=k8s-api-lab.argostranslations.com:6443 \
   --pod-network-cidr=10.244.0.0/16 \
-  --upload-certs
+  --upload-certs \
+  --kubernetes-version=v1.37.2
 ```
 
 Save both complete `kubeadm join` commands printed at the end:
@@ -453,7 +775,7 @@ Save both complete `kubeadm join` commands printed at the end:
 - the worker command does not contain those options.
 
 If initialization fails, inspect the kubelet and control-plane containers
-before resetting anything:
+before changing cluster state:
 
 ```bash
 sudo journalctl -u kubelet -n 100 --no-pager
@@ -481,13 +803,13 @@ The control-plane node remains `NotReady` until a cluster CNI is installed.
 
 ---
 
-## 5. Join the remaining control-plane nodes
+## 6. Join the remaining control-plane nodes
 
 Run the control-plane join command printed by `kubeadm init` as root on both
 `krk-sw-mgr02-l` and `krk-sw-mgr03-l`. It has this form:
 
 ```bash
-sudo kubeadm join 10.11.1.46:6443 \
+sudo kubeadm join k8s-api-lab.argostranslations.com:6443 \
   --token <token> \
   --discovery-token-ca-cert-hash sha256:<hash> \
   --control-plane \
@@ -522,7 +844,7 @@ All three nodes may remain `NotReady` until Calico is installed.
 
 ---
 
-## 6. Install Calico networking
+## 7. Install Calico networking
 
 Run this section only on `krk-sw-mgr01-l` after all three control-plane nodes
 have joined.
@@ -578,13 +900,13 @@ Do not install a second cluster CNI, such as Flannel, on top of Calico.
 
 ---
 
-## 7. Join the worker nodes
+## 8. Join the worker nodes
 
 Run the saved worker command as root on both `krk-sw-int01-l` and
 `krk-sw-int02-l`:
 
 ```bash
-sudo kubeadm join 10.11.1.46:6443 \
+sudo kubeadm join k8s-api-lab.argostranslations.com:6443 \
   --token <token> \
   --discovery-token-ca-cert-hash sha256:<hash>
 ```
@@ -606,7 +928,7 @@ All five nodes should eventually report `Ready`.
 
 ---
 
-## 8. Validate the cluster
+## 9. Validate the cluster
 
 ### Check system health
 
@@ -615,6 +937,59 @@ kubectl get nodes --output=wide
 kubectl get pods --all-namespaces --output=wide
 kubectl get events --all-namespaces --sort-by=.metadata.creationTimestamp
 ```
+
+Confirm that kubeconfig uses the load-balanced DNS endpoint rather than an
+individual manager address:
+
+```bash
+kubectl config view \
+  --minify \
+  --output=jsonpath='{.clusters[0].cluster.server}{"\n"}'
+```
+
+Expected value:
+
+```text
+https://k8s-api-lab.argostranslations.com:6443
+```
+
+### Test API load balancing and VIP failover
+
+On both proxy nodes, verify HAProxy and Keepalived:
+
+```bash
+systemctl is-active haproxy keepalived
+sudo journalctl -u haproxy -u keepalived -n 50 --no-pager
+```
+
+Identify which proxy currently owns `10.11.1.56`:
+
+```bash
+ip -brief address show dev eth0
+```
+
+From `krk-sw-mgr01-l`, continuously query the API while testing failover:
+
+```bash
+watch -n1 kubectl get --raw=/readyz
+```
+
+On the proxy that currently owns the VIP, stop HAProxy:
+
+```bash
+sudo systemctl stop haproxy
+```
+
+Within several seconds, the VIP should move to the other proxy and API queries
+should resume after only a brief interruption. Verify the VIP on the other
+proxy, then restore HAProxy on the original node:
+
+```bash
+sudo systemctl start haproxy
+systemctl is-active haproxy
+```
+
+Repeat the test in the other direction if both failover paths must be proven.
 
 ### Test scheduling, Service routing, and DNS
 
@@ -704,40 +1079,12 @@ ip route
 Check that the Pod CIDR in the Calico installation matches the CIDR passed to
 `kubeadm init`.
 
----
-
-## Reset a lab node
-
-Use reset only when intentionally rebuilding a disposable lab node.
-
-From a control-plane node, drain and remove a worker first:
-
-```bash
-kubectl drain <worker-name> \
-  --ignore-daemonsets \
-  --delete-emptydir-data
-kubectl delete node <worker-name>
-```
-
-On the node being rebuilt:
-
-```bash
-sudo kubeadm reset
-```
-
-`kubeadm reset` does not necessarily remove CNI configuration, network rules,
-or the user's kubeconfig. Inspect them explicitly before reusing the node:
-
-```bash
-sudo ls -la /etc/cni/net.d 2>/dev/null || true
-sudo iptables-save | less
-ls -la "$HOME/.kube" 2>/dev/null || true
-```
-
 ## References
 
 - [Installing kubeadm](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/install-kubeadm/)
 - [Creating a cluster with kubeadm](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/create-cluster-kubeadm/)
+- [Creating highly available clusters with kubeadm](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/high-availability/)
+- [HAProxy health checks](https://www.haproxy.com/documentation/haproxy-configuration-tutorials/reliability/health-checks/)
 - [containerd getting started](https://github.com/containerd/containerd/blob/main/docs/getting-started.md)
 - [cri-tools releases](https://github.com/kubernetes-sigs/cri-tools/releases)
 - [Calico Kubernetes installation](https://docs.tigera.io/calico/latest/getting-started/kubernetes/)
